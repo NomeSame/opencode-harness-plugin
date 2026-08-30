@@ -1,0 +1,7 @@
+name: long-context
+description: Long-context policy — relative compaction threshold
+
+parameters:
+  compaction_threshold:
+    value: 0.80
+    enforced: false

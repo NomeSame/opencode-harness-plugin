@@ -1,0 +1,7 @@
+name: testing
+description: Test strategy policy — generate tests + TDD
+
+parameters:
+  test_strategy:
+    value: generate_tdd
+    enforced: false

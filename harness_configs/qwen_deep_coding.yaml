@@ -1,0 +1,8 @@
+name: Qwen Deep Coding
+description: Canonical preset — enforced Qwen sampling + coding behavior + long-context threshold + TDD test strategy
+harnesses:
+  - qwen
+  - coding
+  - long-context
+  - testing
+model: qwen-3.8-27b

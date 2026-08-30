@@ -1,0 +1,5 @@
+# Python-Laufzeitabhängigkeiten des Harness-Kerns (harness/cli.py, harness/loader.py).
+# Das Windows-DEV-Python benötigt diese ebenfalls (siehe OPENCODE_DEV_FORENSIC_REPORT.md,
+# Follow-up: Real Harness Presets).
+pyyaml>=6.0
+pytest>=7.0

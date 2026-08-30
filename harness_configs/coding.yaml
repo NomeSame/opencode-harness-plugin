@@ -1,0 +1,7 @@
+name: coding
+description: Coding-agent behavior — iteration limit
+
+parameters:
+  max_iterations:
+    value: 30
+    enforced: false

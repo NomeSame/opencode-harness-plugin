@@ -1,0 +1,13 @@
+name: qwen
+description: Qwen-specific defaults — enforced sampling + thinking
+
+parameters:
+  temperature:
+    value: 1.0
+    enforced: true
+  top_p:
+    value: 0.95
+    enforced: true
+  thinking:
+    value: enabled
+    enforced: true

@@ -1,0 +1,8 @@
+{
+  "name": "harness-opencode-plugin",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "solid-js": "1.9.15"
+  }
+}
