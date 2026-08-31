@@ -14,7 +14,83 @@
  */
 
 import { execFileSync } from "node:child_process"
+import { appendFileSync } from "node:fs"
 import { dirname, join } from "node:path"
+
+// Diagnose (nur aktiv wenn HARNESS_CLI_DIAG_FILE gesetzt): loggt pro runCli()-Aufruf
+// eine JSON-Zeile in die angegebene Datei. Ohne die Variable keinerlei Verhaltensänderung.
+// DIAG_FILE wird ZUR LAUFZEIT gelesen (nicht beim Import), damit eine beim Prozessstart
+// gesetzte Umgebungsvariable sicher greift.
+function diagFile(): string | undefined {
+  const f = process.env.HARNESS_CLI_DIAG_FILE
+  return f && f.length > 0 ? f : undefined
+}
+
+function diagWrite(entry: unknown): void {
+  const file = diagFile()
+  if (!file) return
+  try {
+    appendFileSync(file, JSON.stringify(entry) + "\n", "utf-8")
+  } catch {
+    // Diagnose darf den Aufruf nie brechen.
+  }
+}
+
+let runSeq = 0
+
+export function runCli(args: string[]): string {
+  const runId = `${process.pid}-${Date.now()}-${++runSeq}`
+  const started = Date.now()
+  const record: Record<string, unknown> = {
+    runId,
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    pythonExecutable: pythonExecutable(),
+    HARNESS_PYTHON: process.env.HARNESS_PYTHON,
+    timeoutMs: timeoutMs(),
+    cwd: PROJECT_ROOT,
+    pythonPathEntries: (process.env.PATH ?? "").split(";").filter((p) => /python/i.test(p)),
+    args,
+    started,
+  }
+  try {
+    const out = execFileSync(pythonExecutable(), ["-m", "harness.cli", ...args], {
+      encoding: "utf-8",
+      cwd: PROJECT_ROOT,
+      timeout: timeoutMs(),
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    const finished = Date.now()
+    record.finished = finished
+    record.durationMs = finished - started
+    record.ok = true
+    diagWrite(record)
+    return out
+  } catch (error) {
+    const finished = Date.now()
+    record.finished = finished
+    record.durationMs = finished - started
+    record.ok = false
+    const e = error as {
+      name?: string
+      code?: string
+      signal?: string
+      status?: number
+      stdout?: unknown
+      stderr?: unknown
+    }
+    record.error = {
+      name: e.name,
+      code: e.code,
+      signal: e.signal,
+      status: e.status,
+      stdout: e.stdout ?? null,
+      stderr: e.stderr ?? null,
+    }
+    diagWrite(record)
+    throw error
+  }
+}
 import { fileURLToPath } from "node:url"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
@@ -46,15 +122,6 @@ export function timeoutMs(): number {
 
 export function warn(message: string): void {
   console.error(`[harness] ${message}`)
-}
-
-export function runCli(args: string[]): string {
-  return execFileSync(pythonExecutable(), ["-m", "harness.cli", ...args], {
-    encoding: "utf-8",
-    cwd: PROJECT_ROOT,
-    timeout: timeoutMs(),
-    stdio: ["ignore", "pipe", "pipe"],
-  })
 }
 
 export function resolvePreset(presetName: string, configDir?: string): ResolvedParams | null {

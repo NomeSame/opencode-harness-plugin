@@ -1,13 +1,18 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
-import { dirname, join } from "node:path"
-import { getActivePreset, setActivePreset } from "./harness-store.ts"
-import { resolvePreset, listPresets } from "./harness-cli.ts"
-import { applyEnforcedParams } from "./harness-params.ts"
+import type { Plugin } from "@opencode-ai/plugin";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { getActivePreset, setActivePreset } from "./harness-store.ts";
+import { resolvePreset, listPresets } from "./harness-cli.ts";
+import { applyEnforcedParams } from "./harness-params.ts";
+import { Schema } from "effect";
+import {
+  HarnessStatePayload,
+  type HarnessReadState,
+} from "./harness-state-schema.ts";
 
 const TDD_INSTRUCTION =
-  "TDD MODE: Before writing any implementation code, write tests that cover the expected behavior including edge cases (empty input, boundary values, error cases). Implement the code only after the tests are written and define the expected failing state."
+  "TDD MODE: Before writing any implementation code, write tests that cover the expected behavior including edge cases (empty input, boundary values, error cases). Implement the code only after the tests are written and define the expected failing state.";
 
 const TEST_FILE_PATTERNS = [
   /_test\.py$/,
@@ -17,7 +22,7 @@ const TEST_FILE_PATTERNS = [
   /_test\.go$/,
   /^test_.*\.go$/,
   /_spec\.rb$/,
-]
+];
 
 const TEST_RUNNER_PATTERNS = [
   /\bpytest\b/,
@@ -26,18 +31,18 @@ const TEST_RUNNER_PATTERNS = [
   /\bbundle\s+exec\s+rake\b/,
   /\btox\b/,
   /\buv\s+run\s+pytest\b/,
-]
+];
 
 function isTestFilePath(filePath: string): boolean {
-  return TEST_FILE_PATTERNS.some((p) => p.test(filePath))
+  return TEST_FILE_PATTERNS.some((p) => p.test(filePath));
 }
 
 function isTestRunnerCommand(command: string): boolean {
-  return TEST_RUNNER_PATTERNS.some((p) => p.test(command))
+  return TEST_RUNNER_PATTERNS.some((p) => p.test(command));
 }
 
 function isWriteEditTool(toolName: string): boolean {
-  return ["write", "edit", "str_replace_editor"].includes(toolName)
+  return ["write", "edit", "str_replace_editor"].includes(toolName);
 }
 
 /**
@@ -45,60 +50,75 @@ function isWriteEditTool(toolName: string): boolean {
  * Mutiert das Array in-place (nicht `output.parts = [...]`), weil OpenCode
  * intern noch die urspruengliche Array-Referenz verwendet.
  */
-function replacePartsWithMessage(parts: { type: string; text?: string }[], message: string): void {
-  parts.length = 0
-  parts.push({ type: "text", text: message })
+function replacePartsWithMessage(
+  parts: { type: string; text?: string }[],
+  message: string,
+): void {
+  parts.length = 0;
+  parts.push({ type: "text", text: message });
 }
 
-function harnessSetResult(presetName: string, presets: string[] | null): { message: string; activate: boolean } {
+function harnessSetResult(
+  presetName: string,
+  presets: string[] | null,
+): { message: string; activate: boolean } {
   if (!presetName) {
-    const message = presets && presets.length
-      ? `Available Harness presets: ${presets.join(", ")}. Use /harness-set <presetName> to activate one.`
-      : "No Harness presets are configured."
-    return { message, activate: false }
+    const message =
+      presets && presets.length
+        ? `Available Harness presets: ${presets.join(", ")}. Use /harness-set <presetName> to activate one.`
+        : "No Harness presets are configured.";
+    return { message, activate: false };
   }
   if (presets && !presets.includes(presetName)) {
     const message = presets.length
       ? `Unknown Harness preset '${presetName}'. Available presets: ${presets.join(", ")}.`
-      : `Unknown Harness preset '${presetName}'. No presets are configured.`
-    return { message, activate: false }
+      : `Unknown Harness preset '${presetName}'. No presets are configured.`;
+    return { message, activate: false };
   }
-  return { message: `Harness preset '${presetName}' is now active for this session.`, activate: true }
+  return {
+    message: `Harness preset '${presetName}' is now active for this session.`,
+    activate: true,
+  };
 }
 
-const TDD_STATE_DIR = join(homedir(), ".config", "opencode-harness")
-const TDD_STATE_FILE_KEY = "HARNESS_SESSION_STATE_FILE"
+const TDD_STATE_DIR = join(homedir(), ".config", "opencode-harness");
+const TDD_STATE_FILE_KEY = "HARNESS_SESSION_STATE_FILE";
 
 function tddStateFilePath(): string {
-  return process.env[TDD_STATE_FILE_KEY] || join(TDD_STATE_DIR, "tdd-tracked.json")
+  return (
+    process.env[TDD_STATE_FILE_KEY] || join(TDD_STATE_DIR, "tdd-tracked.json")
+  );
 }
 
 function readTddState(): Record<string, { tested?: boolean }> {
   try {
-    const parsed = JSON.parse(readFileSync(tddStateFilePath(), "utf-8"))
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed
+    const parsed = JSON.parse(readFileSync(tddStateFilePath(), "utf-8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+      return parsed;
   } catch {
     // missing or corrupted => empty state
   }
-  return {}
+  return {};
 }
 
 function writeTddState(state: Record<string, { tested?: boolean }>): void {
-  mkdirSync(dirname(tddStateFilePath()), { recursive: true })
-  const tmp = `${tddStateFilePath()}.tmp-${process.pid}-${Date.now()}`
-  writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: "utf-8" })
-  renameSync(tmp, tddStateFilePath())
+  mkdirSync(dirname(tddStateFilePath()), { recursive: true });
+  const tmp = `${tddStateFilePath()}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: "utf-8" });
+  renameSync(tmp, tddStateFilePath());
 }
 
 function getSessionTested(sessionID: string): boolean {
-  return readTddState()[sessionID]?.tested === true
+  return readTddState()[sessionID]?.tested === true;
 }
 
 function markSessionTested(sessionID: string): void {
-  const state = readTddState()
-  state[sessionID] = { tested: true, trackedAt: Date.now() }
-  writeTddState(state)
+  const state = readTddState();
+  state[sessionID] = { tested: true, trackedAt: Date.now() };
+  writeTddState(state);
 }
+
+const HARNESS_NAMESPACE = "harness";
 
 export const HarnessPlugin: Plugin = async (input) => {
   return {
@@ -106,64 +126,115 @@ export const HarnessPlugin: Plugin = async (input) => {
       // placeholder
     },
     "chat.params": async (chatInput, output) => {
-      const activePreset = getActivePreset(chatInput.sessionID)
-      if (!activePreset) return
-      const params = resolvePreset(activePreset)
-      if (!params) return
-      applyEnforcedParams(params, output)
+      const activePreset = getActivePreset(chatInput.sessionID);
+      if (!activePreset) return;
+      const params = resolvePreset(activePreset);
+      if (!params) return;
+      applyEnforcedParams(params, output);
     },
     "command.execute.before": async (cmdInput, output) => {
-      if (cmdInput.command !== "harness-set") return
-      const presetName = cmdInput.arguments.trim()
-      const presets = listPresets()
-      const { message, activate } = harnessSetResult(presetName, presets)
-      if (activate) setActivePreset(cmdInput.sessionID, presetName)
-      if (output?.parts) replacePartsWithMessage(output.parts, message)
+      if (cmdInput.command !== "harness-set") return;
+      const presetName = cmdInput.arguments.trim();
+      const presets = listPresets();
+      const { message, activate } = harnessSetResult(presetName, presets);
+      if (activate) setActivePreset(cmdInput.sessionID, presetName);
+      if (output?.parts) replacePartsWithMessage(output.parts, message);
+    },
+    "session.state.read": async (stateInput, output) => {
+      if (stateInput.namespace !== HARNESS_NAMESPACE) return;
+      const presets = listPresets() ?? [];
+      const activePreset = getActivePreset(stateInput.sessionID);
+      // The generic response payload is opaque JSON, so undefined keys must
+      // not be emitted (Schema.Unknown rejects them as non-JSON values).
+      output.payload = {
+        ...(activePreset !== undefined ? { activePreset } : {}),
+        presets,
+      } satisfies HarnessReadState;
+    },
+    "plugin.state.read": async (stateInput, output) => {
+      if (stateInput.namespace !== HARNESS_NAMESPACE) return;
+      const presets = listPresets();
+      if (presets === null) throw new Error("Unable to read Harness presets.");
+      output.payload = { presets } satisfies Pick<HarnessReadState, "presets">;
+    },
+    "session.state.write": async (stateInput) => {
+      if (stateInput.namespace !== HARNESS_NAMESPACE) return;
+      // Throwing here is the reject path: Core has no Harness-specific error
+      // channel for this generic hook, so any thrown error becomes a clean
+      // 400 at the HTTP boundary (see SessionHttpApi.stateWrite).
+      const decoded = Schema.decodeUnknownSync(HarnessStatePayload)(
+        stateInput.payload,
+      );
+      if (decoded.activePreset === undefined) return;
+      const presets = listPresets();
+      if (presets && !presets.includes(decoded.activePreset)) {
+        throw new Error(
+          `Unknown Harness preset '${decoded.activePreset}'. Available presets: ${presets.join(", ")}.`,
+        );
+      }
+      // testStrategy/compactionThreshold are validated above but have no
+      // dedicated store yet — harness-store.ts remains the sole source of
+      // truth for activePreset, and no new storage is introduced for them.
+      setActivePreset(stateInput.sessionID, decoded.activePreset);
     },
     "experimental.chat.system.transform": async (sysInput, output) => {
-      const activePreset = getActivePreset(sysInput.sessionID)
-      if (!activePreset) return
-      const params = resolvePreset(activePreset)
-      if (!params) return
-      const strategy = params.test_strategy
-      if (strategy && typeof strategy === "object" && strategy.value === "generate_tdd") {
-        output.system.push(TDD_INSTRUCTION)
+      const activePreset = getActivePreset(sysInput.sessionID);
+      if (!activePreset) return;
+      const params = resolvePreset(activePreset);
+      if (!params) return;
+      const strategy = params.test_strategy;
+      if (
+        strategy &&
+        typeof strategy === "object" &&
+        strategy.value === "generate_tdd"
+      ) {
+        output.system.push(TDD_INSTRUCTION);
       }
     },
     "tool.execute.before": async (toolInput, output) => {
-      const activePreset = getActivePreset(toolInput.sessionID)
-      if (!activePreset) return
-      const params = resolvePreset(activePreset)
-      if (!params) return
-      const strategy = params.test_strategy
-      if (!strategy || typeof strategy !== "object" || strategy.value !== "generate_tdd") return
-      if (!isWriteEditTool(toolInput.tool)) return
-      const args = toolInput.args as Record<string, any> || {}
-      const filePath = args.path ?? args.file ?? args.filePath
-      if (!filePath || typeof filePath !== "string") return
-      if (isTestFilePath(filePath)) return
-      if (getSessionTested(toolInput.sessionID)) return
-      console.error(
-        `[harness] WARNING: Writing to non-test file '${filePath}' in session '${toolInput.sessionID}`
-          + ` with test_strategy=generate_tdd, but no test run has been executed yet.`
-          + ` Follow TDD: write tests first, then implementation.`
+      const activePreset = getActivePreset(toolInput.sessionID);
+      if (!activePreset) return;
+      const params = resolvePreset(activePreset);
+      if (!params) return;
+      const strategy = params.test_strategy;
+      if (
+        !strategy ||
+        typeof strategy !== "object" ||
+        strategy.value !== "generate_tdd"
       )
+        return;
+      if (!isWriteEditTool(toolInput.tool)) return;
+      const args = (toolInput.args as Record<string, any>) || {};
+      const filePath = args.path ?? args.file ?? args.filePath;
+      if (!filePath || typeof filePath !== "string") return;
+      if (isTestFilePath(filePath)) return;
+      if (getSessionTested(toolInput.sessionID)) return;
+      console.error(
+        `[harness] WARNING: Writing to non-test file '${filePath}' in session '${toolInput.sessionID}` +
+          ` with test_strategy=generate_tdd, but no test run has been executed yet.` +
+          ` Follow TDD: write tests first, then implementation.`,
+      );
     },
     "tool.execute.after": async (toolInput, output) => {
-      const activePreset = getActivePreset(toolInput.sessionID)
-      if (!activePreset) return
-      const params = resolvePreset(activePreset)
-      if (!params) return
-      const strategy = params.test_strategy
-      if (!strategy || typeof strategy !== "object" || strategy.value !== "generate_tdd") return
-      if (toolInput.tool !== "shell") return
-      const args = toolInput.args as Record<string, any> || {}
-      const command = args.command ?? args.cmd ?? args._
-      if (typeof command !== "string") return
+      const activePreset = getActivePreset(toolInput.sessionID);
+      if (!activePreset) return;
+      const params = resolvePreset(activePreset);
+      if (!params) return;
+      const strategy = params.test_strategy;
+      if (
+        !strategy ||
+        typeof strategy !== "object" ||
+        strategy.value !== "generate_tdd"
+      )
+        return;
+      if (toolInput.tool !== "shell") return;
+      const args = (toolInput.args as Record<string, any>) || {};
+      const command = args.command ?? args.cmd ?? args._;
+      if (typeof command !== "string") return;
       if (isTestRunnerCommand(command)) {
-        markSessionTested(toolInput.sessionID)
+        markSessionTested(toolInput.sessionID);
       }
     },
-  }
-}
-export default HarnessPlugin
+  };
+};
+export default HarnessPlugin;

@@ -12,6 +12,9 @@ TODO_V3.md
 Opencode_Dev/
 .claude/
 
+opencode-plugin/node_modules/
+harness-cli-diag.log
+
 .opencode/node_modules/
 .opencode/package.json
 .opencode/package-lock.json
