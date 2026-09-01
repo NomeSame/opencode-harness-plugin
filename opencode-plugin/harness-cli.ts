@@ -103,6 +103,17 @@ export interface HarnessParam {
 
 export type ResolvedParams = Record<string, HarnessParam>
 
+export interface DefaultPresetResult {
+  preset: string | null
+}
+
+export interface PresetDetails {
+  name: string
+  model: string
+  harnesses: string[]
+  parameters: Record<string, HarnessParam>
+}
+
 export function defaultPythonExecutable(platform: NodeJS.Platform = process.platform): string {
   return platform === "win32" ? "python" : "python3"
 }
@@ -169,5 +180,116 @@ export function listPresets(configDir?: string): string[] | null {
   } catch (error) {
     warn(`list-presets returned invalid JSON for dir '${dir}': ${String(error)}`)
     return null
+  }
+}
+
+/** Resolve the configured model default without inventing a fallback preset. */
+export function defaultPresetForModel(modelID: string, configDir?: string): string | null {
+  const dir = configDir ?? defaultConfigDir()
+  let raw: string
+  try {
+    raw = runCli(["default-preset", "--model", modelID, "--dir", dir])
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    warn(`default-preset failed for model '${modelID}': ${message}`)
+    return null
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<DefaultPresetResult>
+    if (!parsed || typeof parsed !== "object") throw new Error("expected JSON object")
+    if (parsed.preset !== null && typeof parsed.preset !== "string") {
+      throw new Error("expected preset to be a string or null")
+    }
+    return parsed.preset ?? null
+  } catch (error) {
+    warn(`default-preset returned invalid JSON for model '${modelID}': ${String(error)}`)
+    return null
+  }
+}
+
+export function describePreset(presetName: string, configDir?: string): PresetDetails | null {
+  const dir = configDir ?? defaultConfigDir()
+  let raw: string
+  try {
+    raw = runCli(["describe-preset", "--preset", presetName, "--dir", dir])
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    warn(`describe-preset failed for preset '${presetName}': ${message}`)
+    return null
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<PresetDetails>
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.name !== "string" ||
+      typeof parsed.model !== "string" ||
+      !Array.isArray(parsed.harnesses) ||
+      !parsed.harnesses.every((item) => typeof item === "string") ||
+      !parsed.parameters ||
+      typeof parsed.parameters !== "object" ||
+      Array.isArray(parsed.parameters)
+    ) {
+      throw new Error("expected preset details object")
+    }
+    return parsed as PresetDetails
+  } catch (error) {
+    warn(`describe-preset returned invalid JSON for preset '${presetName}': ${String(error)}`)
+    return null
+  }
+}
+
+/** Persist one parameter in the existing source file for a harness. */
+export function editHarness(
+  harnessName: string,
+  parameterName: string,
+  valueLiteral: string,
+  enforced: boolean,
+  configDir?: string,
+): boolean {
+  const dir = configDir ?? defaultConfigDir()
+  if (!harnessName.trim() || !parameterName.trim() || !valueLiteral.trim()) return false
+  try {
+    runCli([
+      "edit",
+      "--name",
+      harnessName,
+      "--dir",
+      dir,
+      "--set-parameter",
+      `${parameterName}=${valueLiteral},${enforced ? "true" : "false"}`,
+    ])
+    return true
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    warn(`edit failed for harness '${harnessName}': ${message}`)
+    return false
+  }
+}
+
+/** Persist one add/remove operation in an existing preset composition. */
+export function editPresetComposition(
+  presetName: string,
+  operation: "add" | "remove",
+  harnessName: string,
+  configDir?: string,
+): boolean {
+  const dir = configDir ?? defaultConfigDir()
+  if (!presetName.trim() || !harnessName.trim()) return false
+  try {
+    runCli([
+      "edit-preset",
+      "--name",
+      presetName,
+      "--dir",
+      dir,
+      operation === "add" ? "--add-harness" : "--remove-harness",
+      harnessName,
+    ])
+    return true
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    warn(`edit-preset failed for preset '${presetName}': ${message}`)
+    return false
   }
 }

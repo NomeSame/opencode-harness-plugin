@@ -1,0 +1,7 @@
+name: final-authority
+description: Final Authority — enforced sampling values at the provider boundary
+
+parameters:
+  temperature:
+    value: 1.0
+    enforced: true

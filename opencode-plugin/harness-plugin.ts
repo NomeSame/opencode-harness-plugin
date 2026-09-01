@@ -2,8 +2,8 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { getActivePreset, setActivePreset } from "./harness-store.ts";
-import { resolvePreset, listPresets } from "./harness-cli.ts";
+import { clearActivePreset, getActivePreset, setActivePreset } from "./harness-store.ts";
+import { defaultPresetForModel, describePreset, editHarness, resolvePreset, listPresets } from "./harness-cli.ts";
 import { applyEnforcedParams } from "./harness-params.ts";
 import { Schema } from "effect";
 import {
@@ -118,7 +118,46 @@ function markSessionTested(sessionID: string): void {
   writeTddState(state);
 }
 
+function clearSessionTested(sessionID: string): void {
+  const state = readTddState();
+  if (!state[sessionID]?.tested) return;
+  state[sessionID] = { tested: false, trackedAt: Date.now() };
+  writeTddState(state);
+}
+
 const HARNESS_NAMESPACE = "harness";
+
+// Automatic model defaults are tracked separately from the persisted active
+// preset. A persisted preset without this marker is treated as a manual user
+// choice, so a restart cannot silently replace it.
+const automaticPresetBySession = new Map<string, { presetName: string; modelID: string }>();
+const manualPresetSessions = new Set<string>();
+
+function modelIDs(model: any): string[] {
+  return [model?.id, model?.modelID, model?.api?.id].filter(
+    (value, index, values): value is string => typeof value === "string" && value.length > 0 && values.indexOf(value) === index,
+  );
+}
+
+function activePresetForModel(sessionID: string, model: any): string | undefined {
+  const ids = modelIDs(model);
+  const currentModelID = ids[0];
+  const stored = getActivePreset(sessionID);
+  const automatic = automaticPresetBySession.get(sessionID);
+
+  if (manualPresetSessions.has(sessionID) || (stored && !automatic)) return stored;
+  if (automatic && stored && automatic.modelID === currentModelID) return stored;
+
+  const defaultName = ids.map((id) => defaultPresetForModel(id)).find((name): name is string => !!name);
+  if (!defaultName) {
+    if (automatic) clearActivePreset(sessionID);
+    automaticPresetBySession.delete(sessionID);
+    return undefined;
+  }
+  setActivePreset(sessionID, defaultName);
+  automaticPresetBySession.set(sessionID, { presetName: defaultName, modelID: currentModelID ?? ids[0] ?? "" });
+  return defaultName;
+}
 
 export const HarnessPlugin: Plugin = async (input) => {
   return {
@@ -126,19 +165,82 @@ export const HarnessPlugin: Plugin = async (input) => {
       // placeholder
     },
     "chat.params": async (chatInput, output) => {
-      const activePreset = getActivePreset(chatInput.sessionID);
+      const activePreset = activePresetForModel(chatInput.sessionID, chatInput.model);
       if (!activePreset) return;
       const params = resolvePreset(activePreset);
       if (!params) return;
       applyEnforcedParams(params, output);
     },
+    "experimental.session.compaction.threshold": async (compactionInput, output) => {
+      const activePreset = activePresetForModel(compactionInput.sessionID, compactionInput.model);
+      if (!activePreset) return;
+      const params = resolvePreset(activePreset);
+      const threshold = params?.compaction_threshold;
+      if (!threshold || typeof threshold !== "object") return;
+      if (typeof threshold.value !== "number" || !Number.isFinite(threshold.value)) return;
+      if (threshold.value < 0 || threshold.value > 1) return;
+      output.threshold = threshold.value;
+    },
+    "experimental.session.before_finish": async (finishInput, output) => {
+      const activePreset = activePresetForModel(finishInput.sessionID, finishInput.model);
+      if (!activePreset) return;
+      const params = resolvePreset(activePreset);
+      const strategy = params?.test_strategy;
+      if (!strategy || typeof strategy !== "object") return;
+      if (strategy.value !== "generate_tdd" && strategy.value !== "run_existing") return;
+      const configured = params?.test_execution_before_finishing;
+      if (configured && typeof configured === "object" && configured.value === false) return;
+      if (getSessionTested(finishInput.sessionID)) return;
+      output.allow = false;
+      output.reason = "A passing test run is required before finishing this Harness task.";
+    },
     "command.execute.before": async (cmdInput, output) => {
+      if (cmdInput.command === "harness-edit") {
+        const activePreset = getActivePreset(cmdInput.sessionID);
+        let message = "No active Harness preset is available to edit.";
+        try {
+          const request = JSON.parse(cmdInput.arguments) as {
+            harness?: unknown;
+            parameter?: unknown;
+            value?: unknown;
+            enforced?: unknown;
+          };
+          const detail = activePreset ? describePreset(activePreset) : null;
+          if (
+            detail &&
+            typeof request.harness === "string" &&
+            detail.harnesses.includes(request.harness) &&
+            typeof request.parameter === "string" &&
+            typeof request.value === "string" &&
+            typeof request.enforced === "boolean"
+          ) {
+            const saved = editHarness(request.harness, request.parameter, request.value, request.enforced);
+            message = saved
+              ? `Harness '${request.harness}' was saved. Re-open Switch harness to reload '${activePreset}'.`
+              : `Failed to save Harness '${request.harness}'. The existing file was left unchanged.`;
+          } else {
+            message = "Invalid edit request. Choose a harness from the active preset and provide a Python literal value.";
+          }
+        } catch {
+          message = "Invalid edit request. Use JSON with harness, parameter, value and enforced fields.";
+        }
+        if (output?.parts) replacePartsWithMessage(output.parts, message);
+        output.noReply = true;
+        return;
+      }
       if (cmdInput.command !== "harness-set") return;
       const presetName = cmdInput.arguments.trim();
       const presets = listPresets();
       const { message, activate } = harnessSetResult(presetName, presets);
-      if (activate) setActivePreset(cmdInput.sessionID, presetName);
+      if (activate) {
+        setActivePreset(cmdInput.sessionID, presetName);
+        manualPresetSessions.add(cmdInput.sessionID);
+        automaticPresetBySession.delete(cmdInput.sessionID);
+      }
       if (output?.parts) replacePartsWithMessage(output.parts, message);
+      // The command is a state operation. Its confirmation must be persisted
+      // as a user message without starting an agent loop.
+      output.noReply = true;
     },
     "session.state.read": async (stateInput, output) => {
       if (stateInput.namespace !== HARNESS_NAMESPACE) return;
@@ -155,7 +257,13 @@ export const HarnessPlugin: Plugin = async (input) => {
       if (stateInput.namespace !== HARNESS_NAMESPACE) return;
       const presets = listPresets();
       if (presets === null) throw new Error("Unable to read Harness presets.");
-      output.payload = { presets } satisfies Pick<HarnessReadState, "presets">;
+      const details = Object.fromEntries(
+        presets.flatMap((preset) => {
+          const detail = describePreset(preset);
+          return detail ? [[preset, detail]] : [];
+        }),
+      );
+      output.payload = { presets, details } satisfies Pick<HarnessReadState, "presets" | "details">;
     },
     "session.state.write": async (stateInput) => {
       if (stateInput.namespace !== HARNESS_NAMESPACE) return;
@@ -176,9 +284,13 @@ export const HarnessPlugin: Plugin = async (input) => {
       // dedicated store yet — harness-store.ts remains the sole source of
       // truth for activePreset, and no new storage is introduced for them.
       setActivePreset(stateInput.sessionID, decoded.activePreset);
+      manualPresetSessions.add(stateInput.sessionID);
+      automaticPresetBySession.delete(stateInput.sessionID);
     },
     "experimental.chat.system.transform": async (sysInput, output) => {
-      const activePreset = getActivePreset(sysInput.sessionID);
+      const activePreset = sysInput.sessionID
+        ? activePresetForModel(sysInput.sessionID, sysInput.model)
+        : undefined;
       if (!activePreset) return;
       const params = resolvePreset(activePreset);
       if (!params) return;
@@ -208,11 +320,17 @@ export const HarnessPlugin: Plugin = async (input) => {
       const filePath = args.path ?? args.file ?? args.filePath;
       if (!filePath || typeof filePath !== "string") return;
       if (isTestFilePath(filePath)) return;
-      if (getSessionTested(toolInput.sessionID)) return;
+      if (getSessionTested(toolInput.sessionID)) {
+        clearSessionTested(toolInput.sessionID);
+        return;
+      }
       console.error(
         `[harness] WARNING: Writing to non-test file '${filePath}' in session '${toolInput.sessionID}` +
           ` with test_strategy=generate_tdd, but no test run has been executed yet.` +
           ` Follow TDD: write tests first, then implementation.`,
+      );
+      throw new Error(
+        `TDD order violation: run the generated tests before writing implementation file '${filePath}'.`,
       );
     },
     "tool.execute.after": async (toolInput, output) => {
@@ -232,6 +350,15 @@ export const HarnessPlugin: Plugin = async (input) => {
       const command = args.command ?? args.cmd ?? args._;
       if (typeof command !== "string") return;
       if (isTestRunnerCommand(command)) {
+        const metadata = output.metadata;
+        const exitCode =
+          metadata && typeof metadata === "object" && "exit" in metadata
+            ? (metadata as { exit?: unknown }).exit
+            : undefined;
+        if (typeof exitCode === "number" && exitCode !== 0) {
+          clearSessionTested(toolInput.sessionID);
+          return;
+        }
         markSessionTested(toolInput.sessionID);
       }
     },

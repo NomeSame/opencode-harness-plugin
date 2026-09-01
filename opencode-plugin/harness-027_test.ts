@@ -71,8 +71,13 @@ function makeConfigDir(base: string): string {
     { encoding: "utf-8", flag: "wx" }
   )
   writeFileSync(
+    join(dir, "long-context.yaml"),
+    "name: long-context\nparameters:\n  compaction_threshold: {value: 0.80}\n",
+    { encoding: "utf-8", flag: "wx" },
+  )
+  writeFileSync(
     join(dir, "qwen_deep_coding.yaml"),
-    "name: Qwen Deep Coding\nharnesses:\n  - qwen\n  - coding\n",
+    "name: Qwen Deep Coding\nharnesses:\n  - qwen\n  - coding\n  - long-context\nmodel: qwen-3.8-27b\n",
     { encoding: "utf-8", flag: "wx" }
   )
   return dir
@@ -433,4 +438,78 @@ test("D5 hooks object exposes chat.params and event", async () => {
   const hooks = await HarnessPlugin({})
   assert.equal(typeof hooks["chat.params"], "function")
   assert.equal(typeof hooks.event, "function")
+})
+
+test("D6 model default is applied automatically through the real CLI", async (t) => {
+  const tmp = makeTmp("harness-hook-model-default/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  const hooks = await HarnessPlugin({})
+  const output = makeOutput()
+
+  await hooks["chat.params"](
+    { sessionID: "ses_model_default", model: { id: "qwen-3.8-27b" } },
+    output,
+  )
+
+  assert.equal(store.getActivePreset("ses_model_default"), "Qwen Deep Coding")
+  assert.equal(output.temperature, 1.0)
+  assert.equal(output.options.thinking, "enabled")
+})
+
+test("D7 switching an automatic session to an unmapped model clears the automatic preset", async (t) => {
+  const tmp = makeTmp("harness-hook-model-switch/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  const hooks = await HarnessPlugin({})
+
+  await hooks["chat.params"](
+    { sessionID: "ses_model_switch", model: { id: "qwen-3.8-27b" } },
+    makeOutput(),
+  )
+  const output = makeOutput()
+  await hooks["chat.params"](
+    { sessionID: "ses_model_switch", model: { id: "unmapped-model" } },
+    output,
+  )
+
+  assert.equal(store.getActivePreset("ses_model_switch"), undefined)
+  assert.equal(output.temperature, 0.7)
+  assert.deepEqual(output.options, {})
+})
+
+test("D8 compaction threshold hook exposes the active Long Context policy", async (t) => {
+  const tmp = makeTmp("harness-hook-compaction/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  withEnv(t, { HARNESS_PRESET_FILE: join(tmp, "active-presets.json"), HARNESS_CONFIG_DIR: configDir })
+  const hooks = await HarnessPlugin({})
+  const output: { threshold?: number } = {}
+
+  await hooks["experimental.session.compaction.threshold"](
+    { sessionID: "ses_compaction", model: { id: "qwen-3.8-27b" } },
+    output,
+  )
+
+  assert.equal(output.threshold, 0.8)
+})
+
+test("D9 an unmapped model does not inherit a compaction threshold", async (t) => {
+  const tmp = makeTmp("harness-hook-compaction-none/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  withEnv(t, { HARNESS_PRESET_FILE: join(tmp, "active-presets.json"), HARNESS_CONFIG_DIR: configDir })
+  const hooks = await HarnessPlugin({})
+  const output: { threshold?: number } = {}
+
+  await hooks["experimental.session.compaction.threshold"](
+    { sessionID: "ses_compaction_none", model: { id: "unmapped-model" } },
+    output,
+  )
+
+  assert.equal(output.threshold, undefined)
 })

@@ -7,9 +7,13 @@ DoD TODO-021:
 - Test deckt diesen Fall explizit ab.
 """
 
+from pathlib import Path
+
 from harness.data_model import Harness, Parameter, Preset
+from harness.cli import load_config_files
 from harness.loader import load_harness_from_dict
 from harness.merge import merge_harnesses
+from harness.preset import PresetResolver
 
 
 class MockProvider:
@@ -88,6 +92,25 @@ class TestFinalRequestEnforcement:
         # Simulate final request resolution
         final_value = _resolve_final_value(opencode_params, harness_enforced)
         assert final_value == 1.0
+
+    def test_canonical_final_authority_preset_reaches_provider_boundary(self):
+        """The shipped Final Authority config controls the prepared request."""
+        config_dir = Path(__file__).parents[1] / "harness_configs"
+        harnesses, presets = load_config_files(config_dir)
+        preset = next(p for p in presets if p.name == "Final Authority")
+        enforced = PresetResolver(harnesses).resolve(preset)
+
+        opencode_request = {"temperature": 0.3}
+        final_request = dict(opencode_request)
+        for name, parameter in enforced.parameters.items():
+            if parameter.is_enforced():
+                final_request[name] = parameter.value
+
+        provider = MockProvider()
+        provider.send_request(final_request)
+
+        assert provider.received_params["temperature"] == 1.0
+        assert enforced.get_parameter("temperature").is_enforced()
 
 
 def _resolve_final_value(opencode_params: dict, harness_enforced: dict) -> any:

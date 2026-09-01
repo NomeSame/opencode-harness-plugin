@@ -12,8 +12,8 @@ DoD TODO-020:
 import tempfile
 
 from harness.data_model import Harness, Parameter, Preset
-from harness.editor import HarnessEditor
-from harness.loader import load_harness_from_dict, load_harness_from_file
+from harness.editor import HarnessEditor, PresetEditor
+from harness.loader import load_harness_from_dict, load_harness_from_file, load_preset_from_file
 
 
 class TestHarnessCreation:
@@ -123,6 +123,14 @@ class TestPresetEditing:
         assert "b" in preset.harnesses
         assert "a" not in preset.harnesses
 
+    def test_preset_editor_changes_composition(self):
+        editor = PresetEditor(Preset(name="test", harnesses=["qwen", "coding"], model="model-a"))
+        editor.add_harness("long-context")
+        editor.remove_harness("coding")
+
+        assert editor.get_preset().harnesses == ["qwen", "long-context"]
+        assert editor.get_preset().model == "model-a"
+
 
 class TestPersistence:
     """Tests for persistent storage."""
@@ -149,3 +157,16 @@ class TestPersistence:
         assert loaded.has_parameter("temperature")
         assert loaded.get_parameter("temperature").is_enforced()
         assert loaded.get_parameter("max_iterations").value == 30
+
+    def test_preset_editor_persists_existing_yaml_composition(self, tmp_path):
+        source = tmp_path / "preset.yaml"
+        source.write_text(
+            "name: Test\nharnesses:\n  - qwen\nmodel: model-a\n",
+            encoding="utf-8",
+        )
+        editor = PresetEditor(Preset(name="Test", harnesses=["qwen", "coding"], model="model-a"))
+        editor.save_to_file(source)
+        loaded = load_preset_from_file(source)
+
+        assert loaded.harnesses == ["qwen", "coding"]
+        assert loaded.model == "model-a"

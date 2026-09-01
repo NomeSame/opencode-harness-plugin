@@ -8,6 +8,7 @@ Output on failure: {"error": "..."} on stderr, exit code != 0.
 """
 
 import argparse
+
 import json
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 import yaml
 
 from harness.data_model import Harness, Preset
+from harness.editor import HarnessEditor, PresetEditor
 from harness.loader import load_harness_from_dict
 from harness.preset import PresetResolver
 
@@ -114,6 +116,33 @@ def resolve_preset_to_params(preset_name: str, harness_dir: str | Path) -> dict:
     }
 
 
+def default_preset_for_model(model_id: str, harness_dir: str | Path) -> str | None:
+    """Return the configured default preset for ``model_id``, if one exists."""
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("model_id must be a non-empty string")
+    _, presets = load_config_files(Path(harness_dir))
+    for preset in presets:
+        if preset.model == model_id:
+            return preset.name
+    return None
+
+
+def describe_preset(preset_name: str, harness_dir: str | Path) -> dict:
+    """Return composition and effective parameters for one preset."""
+    harnesses, presets = load_config_files(Path(harness_dir))
+    preset = _find_preset(presets, preset_name)
+    merged = PresetResolver(harnesses).resolve(preset)
+    return {
+        "name": preset.name,
+        "model": preset.model,
+        "harnesses": list(preset.harnesses),
+        "parameters": {
+            name: {"value": param.value, "enforced": param.enforced}
+            for name, param in merged.parameters.items()
+        },
+    }
+
+
 class CliUsageError(Exception):
     """A usage error reported as structured JSON instead of argparse text."""
 
@@ -143,6 +172,18 @@ def _build_parser() -> _CliArgumentParser:
     )
     list_presets.add_argument("--dir", required=True, help="Directory with config files.")
 
+    default_preset = subparsers.add_parser(
+        "default-preset", help="Resolve the default preset for a model."
+    )
+    default_preset.add_argument("--model", required=True, help="Model ID.")
+    default_preset.add_argument("--dir", required=True, help="Directory with config files.")
+
+    describe = subparsers.add_parser(
+        "describe-preset", help="Describe a preset composition and effective parameters."
+    )
+    describe.add_argument("--preset", required=True, help="Preset name.")
+    describe.add_argument("--dir", required=True, help="Directory with config files.")
+
     edit = subparsers.add_parser(
         "edit", help="Edit a harness (set/remove parameters, save)."
     )
@@ -151,11 +192,61 @@ def _build_parser() -> _CliArgumentParser:
     edit.add_argument("--set-parameter", action="append", help="Set parameter: name=value,enforced (repeatable).")
     edit.add_argument("--remove-parameter", action="append", help="Remove parameter by name (repeatable).")
     edit.add_argument("--output", help="Output file name (default: <harness-name>.json).")
+    edit_preset = subparsers.add_parser(
+        "edit-preset", help="Edit the harness composition of an existing preset."
+    )
+    edit_preset.add_argument("--name", required=True, help="Preset name to edit.")
+    edit_preset.add_argument("--dir", required=True, help="Directory with config files.")
+    edit_preset.add_argument("--add-harness", action="append", help="Add a harness name.")
+    edit_preset.add_argument("--remove-harness", action="append", help="Remove a harness name.")
+    edit_preset.add_argument("--output", help="Output file (default: existing preset file).")
     return parser
+
+
+def _find_config_path(directory: Path, name: str, preset: bool) -> Path | None:
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or path.suffix not in _CONFIG_SUFFIXES:
+            continue
+        data = _load_mapping(path)
+        if bool("harnesses" in data) is preset and str(data.get("name", "")).lower() == name.lower():
+            return path
+    return None
+
+
+def _output_path(directory: Path, output: str | None, source: Path) -> Path:
+    if output is None:
+        return source
+    candidate = Path(output)
+    return candidate if candidate.is_absolute() else directory / candidate
 
 
 def _error(message: str) -> str:
     return json.dumps({"error": message})
+
+
+def _parse_parameter_spec(spec: str) -> tuple[str, object, bool]:
+    """Parse and validate the ``name=value,enforced`` CLI format."""
+    import ast
+
+    try:
+        name, rest = spec.split("=", 1)
+        value_str, enforced_str = rest.rsplit(",", 1)
+    except ValueError as exc:
+        raise ValueError(
+            "parameter must use 'name=value,true|false' format"
+        ) from exc
+
+    name = name.strip()
+    enforced_str = enforced_str.strip().lower()
+    if not name:
+        raise ValueError("parameter name must be non-empty")
+    if enforced_str not in {"true", "false"}:
+        raise ValueError("enforced must be either 'true' or 'false'")
+    try:
+        value = ast.literal_eval(value_str.strip())
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError(f"invalid parameter value: {value_str.strip()!r}") from exc
+    return name, value, enforced_str == "true"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -198,9 +289,26 @@ def main(argv: list[str] | None = None) -> int:
 
         return 0
 
+    if args.command == "default-preset":
+        try:
+            result = default_preset_for_model(args.model, args.dir)
+        except (FileNotFoundError, ValueError) as exc:
+            print(_error(str(exc)), file=sys.stderr)
+            return 1
+        print(json.dumps({"preset": result}))
+        return 0
+
+    if args.command == "describe-preset":
+        try:
+            result = describe_preset(args.preset, args.dir)
+        except (FileNotFoundError, ValueError, KeyError) as exc:
+            print(_error(str(exc)), file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
+
     if args.command == "edit":
         try:
-            from harness.editor import HarnessEditor
             from harness.data_model import Parameter
 
             directory = Path(args.dir)
@@ -221,14 +329,8 @@ def main(argv: list[str] | None = None) -> int:
 
             # Apply operations
             if args.set_parameter:
-                import ast
-
                 for param_str in args.set_parameter:
-                    # Format: name=value,enforced
-                    name, rest = param_str.split("=", 1)
-                    value_str, enforced_str = rest.rsplit(",", 1)
-                    value = ast.literal_eval(value_str)
-                    enforced = enforced_str.lower() == "true"
+                    name, value, enforced = _parse_parameter_spec(param_str)
                     editor.set_parameter(name, value, enforced)
 
             if args.remove_parameter:
@@ -236,8 +338,10 @@ def main(argv: list[str] | None = None) -> int:
                     editor.remove_parameter(name)
 
             # Save to file
-            output_file = args.output or f"{args.name.lower().replace(' ', '-')}.json"
-            editor.save_to_file(Path(args.dir) / output_file)
+            source_file = _find_config_path(directory, args.name, preset=False)
+            if source_file is None:
+                raise ValueError(f"Harness '{args.name}' source file not found")
+            editor.save_to_file(_output_path(directory, args.output, source_file))
 
             print(json.dumps({
                 "name": harness.name,
@@ -248,6 +352,42 @@ def main(argv: list[str] | None = None) -> int:
             }, indent=2))
 
         except (FileNotFoundError, ValueError) as exc:
+            print(_error(str(exc)), file=sys.stderr)
+            return 1
+
+        return 0
+
+    if args.command == "edit-preset":
+        try:
+            directory = Path(args.dir)
+            harnesses, presets = load_config_files(directory)
+            preset = next((item for item in presets if item.name.lower() == args.name.lower()), None)
+            if preset is None:
+                available = ", ".join(item.name for item in presets)
+                raise ValueError(f"Preset '{args.name}' not found. Available: {available}")
+
+            for name in args.add_harness or []:
+                if name not in harnesses:
+                    available = ", ".join(sorted(harnesses)) or "(none)"
+                    raise ValueError(
+                        f"Harness '{name}' not found. Available: {available}"
+                    )
+
+            editor = PresetEditor(preset)
+            for name in args.add_harness or []:
+                editor.add_harness(name)
+            for name in args.remove_harness or []:
+                editor.remove_harness(name)
+            source_file = _find_config_path(directory, args.name, preset=True)
+            if source_file is None:
+                raise ValueError(f"Preset '{args.name}' source file not found")
+            editor.save_to_file(_output_path(directory, args.output, source_file))
+            print(json.dumps({
+                "name": preset.name,
+                "harnesses": preset.harnesses,
+                **({"model": preset.model} if preset.model else {}),
+            }, indent=2))
+        except (FileNotFoundError, ValueError, yaml.YAMLError) as exc:
             print(_error(str(exc)), file=sys.stderr)
             return 1
 

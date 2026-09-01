@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.cli import resolve_preset_to_params
+from harness.cli import default_preset_for_model, resolve_preset_to_params
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -144,6 +144,16 @@ class TestResolvePresetToParams:
         (qwen_dir / "notes.yaml").write_text("just: some text\n", encoding="utf-8")
         result = resolve_preset_to_params("Qwen Deep Coding", qwen_dir)
         assert "temperature" in result
+
+    def test_default_preset_for_model_returns_matching_preset(self, qwen_dir):
+        assert default_preset_for_model("qwen-3.8-27b", qwen_dir) == "Qwen Deep Coding"
+
+    def test_default_preset_for_unknown_model_returns_none(self, qwen_dir):
+        assert default_preset_for_model("unknown-model", qwen_dir) is None
+
+    def test_default_preset_rejects_empty_model(self, qwen_dir):
+        with pytest.raises(ValueError, match="model_id"):
+            default_preset_for_model("", qwen_dir)
 
     def test_non_config_files_are_skipped(self, qwen_dir):
         (qwen_dir / "README.txt").write_text("ignore me", encoding="utf-8")
@@ -279,6 +289,8 @@ class TestEdit:
         assert result["name"] == "qwen"
         assert result["parameters"]["temperature"]["value"] == 1.5
         assert result["parameters"]["temperature"]["enforced"] is True
+        assert (qwen_dir / "qwen.yaml").read_text(encoding="utf-8").find("1.5") >= 0
+        assert not (qwen_dir / "qwen.json").exists()
 
     def test_edit_remove_parameter(self, qwen_dir):
         proc = run_cli(
@@ -319,6 +331,21 @@ class TestEdit:
         saved = json.loads(edited_file.read_text())
         assert saved["name"] == "Test Harness"
 
+    def test_edit_preset_updates_existing_source_file(self, qwen_dir):
+        proc = run_cli(
+            "edit-preset",
+            "--name", "Qwen Deep Coding",
+            "--dir", str(qwen_dir),
+            "--remove-harness", "coding",
+            "--add-harness", "qwen",
+        )
+        assert proc.returncode == 0
+        result = json.loads(proc.stdout)
+        assert result["harnesses"] == ["qwen", "long-context", "testing"]
+        loaded = qwen_dir.joinpath("qwen_deep_coding.yaml").read_text(encoding="utf-8")
+        assert "- coding" not in loaded
+        assert "- qwen" in loaded
+
 
 class TestRealConfigDir:
     """Tests against the real, production harness_configs/ directory (Fix #2).
@@ -348,3 +375,12 @@ class TestRealConfigDir:
         assert proc.returncode == 0, proc.stderr
         names = json.loads(proc.stdout)
         assert "Qwen Deep Coding" in names
+
+    def test_default_preset_command_returns_model_mapping(self):
+        proc = run_cli(
+            "default-preset",
+            "--model", "qwen-3.8-27b",
+            "--dir", str(self.config_dir),
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == {"preset": "Qwen Deep Coding"}

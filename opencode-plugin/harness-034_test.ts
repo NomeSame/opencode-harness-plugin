@@ -11,7 +11,7 @@
  *     - Diese Datei ist KEINE Test-Datei (nicht *_test.py, test_*.py, *.test.ts,
  *       *.spec.ts, test_*.go, *_test.go, *_spec.rb, etc.)
  *     - Fuer diese Session wurde noch KEIN Testlauf ueber TDDRunner (CLI-Bruecke) ausgefuehrt
- *     → console.error Warnung ausgeben (soft warning, kein throw)
+ *     → console.error ausgeben und den Implementation-Write abweisen
  *     - output wird NICHT veraendert (args bleiben unangetastet)
  *
  *   tool.execute.after:
@@ -67,6 +67,11 @@ function makeConfigDir(base: string): string {
     "name: tdd\nparameters:\n  test_strategy: {value: generate_tdd, enforced: true}\n",
     { encoding: "utf-8", flag: "wx" }
   )
+  writeFileSync(
+    join(dir, "tdd_preset.yaml"),
+    "name: tdd\nharnesses:\n  - tdd\n",
+    { encoding: "utf-8", flag: "wx" }
+  )
   return dir
 }
 
@@ -111,7 +116,7 @@ test("G1 tool.execute.before auf write-Tool warnt wenn generate_tdd + kein Testl
   const configDir = makeConfigDir(tmp)
   const storeFile = makeTmp("harness-tool-store/") + "/active-presets.json"
   const sessionFile = makeTmp("harness-tool-session/") + "/tdd-tracked.json"
-  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir, HARNESS_SESSION_STATE_FILE: sessionFile })
   store.setActivePreset("ses_warn", "tdd")
   writeTddStore(t, sessionFile)
 
@@ -123,7 +128,7 @@ test("G1 tool.execute.before auf write-Tool warnt wenn generate_tdd + kein Testl
     callID: "call_1",
     args: { path: "src/main.py", content: "print('hello')" },
   }
-  await hooks["tool.execute.before"](input, output)
+  await assert.rejects(() => hooks["tool.execute.before"](input, output), /TDD order violation/)
   assert.equal(input.args.path, "src/main.py")
   assert.deepEqual(output.args, {})
 })
@@ -134,7 +139,7 @@ test("G2 tool.execute.before warnt auch bei edit-Tool", async (t) => {
   const configDir = makeConfigDir(tmp)
   const storeFile = makeTmp("harness-tool-store2/") + "/active-presets.json"
   const sessionFile = makeTmp("harness-tool-session2/") + "/tdd-tracked.json"
-  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir, HARNESS_SESSION_STATE_FILE: sessionFile })
   store.setActivePreset("ses_edit", "tdd")
   writeTddStore(t, sessionFile)
 
@@ -146,7 +151,7 @@ test("G2 tool.execute.before warnt auch bei edit-Tool", async (t) => {
     callID: "call_2",
     args: { path: "src/main.py", old_string: "hello", new_string: "world" },
   }
-  await hooks["tool.execute.before"](input, output)
+  await assert.rejects(() => hooks["tool.execute.before"](input, output), /TDD order violation/)
 })
 
 test("G3 tool.execute.before warnt nicht fuer Test-Dateien", async (t) => {
@@ -156,7 +161,7 @@ test("G3 tool.execute.before warnt nicht fuer Test-Dateien", async (t) => {
     const configDir = makeConfigDir(tmp)
     const storeFile = makeTmp("harness-tool-store3/") + "/active-presets.json"
     const sessionFile = makeTmp("harness-tool-session3/") + "/tdd-tracked.json"
-    withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+    withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir, HARNESS_SESSION_STATE_FILE: sessionFile })
     store.setActivePreset("ses_tf", "tdd")
     writeTddStore(t, sessionFile)
 
@@ -178,7 +183,7 @@ test("G4 tool.execute.after markiert Shell-Test-Runner-Call als Testlauf", async
   const configDir = makeConfigDir(tmp)
   const storeFile = makeTmp("harness-tool-store4/") + "/active-presets.json"
   const sessionFile = makeTmp("harness-tool-session4/") + "/tdd-tracked.json"
-  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir, HARNESS_SESSION_STATE_FILE: sessionFile })
   store.setActivePreset("ses_after", "tdd")
   writeTddStore(t, sessionFile)
 
@@ -201,6 +206,11 @@ test("G4 tool.execute.after markiert Shell-Test-Runner-Call als Testlauf", async
     args: { path: "src/main.py", content: "new code" },
   }
   await hooks["tool.execute.before"](input2, output2)
+  await assert.rejects(
+    () => hooks["tool.execute.before"](input2, makeOutputToolBefore()),
+    /TDD order violation/,
+    "a second implementation write requires a fresh test run",
+  )
 })
 
 test("G5 tool.execute.after ignoriert keine-Test-Runner-Shell-Befehle", async (t) => {
@@ -209,7 +219,7 @@ test("G5 tool.execute.after ignoriert keine-Test-Runner-Shell-Befehle", async (t
   const configDir = makeConfigDir(tmp)
   const storeFile = makeTmp("harness-tool-store5/") + "/active-presets.json"
   const sessionFile = makeTmp("harness-tool-session5/") + "/tdd-tracked.json"
-  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir, HARNESS_SESSION_STATE_FILE: sessionFile })
   store.setActivePreset("ses_shell", "tdd")
   writeTddStore(t, sessionFile)
 
@@ -222,6 +232,42 @@ test("G5 tool.execute.after ignoriert keine-Test-Runner-Shell-Befehle", async (t
     args: { command: "ls -la" },
   }
   await hooks["tool.execute.after"](input, output)
+})
+
+test("G5b fehlgeschlagener Testlauf gilt nicht als bestandener Testlauf", async (t) => {
+  const tmp = makeTmp("harness-tool-failed-test/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = makeTmp("harness-tool-store-failed/") + "/active-presets.json"
+  const sessionFile = makeTmp("harness-tool-session-failed/") + "/tdd-tracked.json"
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir, HARNESS_SESSION_STATE_FILE: sessionFile })
+  store.setActivePreset("ses_failed", "tdd")
+  writeTddStore(t, sessionFile)
+
+  const hooks = await HarnessPlugin({})
+  await hooks["tool.execute.after"](
+    {
+      tool: "shell",
+      sessionID: "ses_failed",
+      callID: "call_failed",
+      args: { command: "pytest tests/" },
+    },
+    { title: "pytest tests/", output: "1 failed", metadata: { exit: 1 } },
+  )
+
+  await assert.rejects(
+    () =>
+      hooks["tool.execute.before"](
+        {
+          tool: "write",
+          sessionID: "ses_failed",
+          callID: "call_after_failed",
+          args: { path: "src/main.py", content: "new code" },
+        },
+        makeOutputToolBefore(),
+      ),
+    /TDD order violation/,
+  )
 })
 
 test("G6 tool.execute.before/after ohne aktives Preset: kein Verhalten", async (t) => {
@@ -264,4 +310,38 @@ test("G9 Hooks exposed im Plugin-Objekt", async () => {
   const hooks = await HarnessPlugin({})
   assert.equal(typeof hooks["tool.execute.before"], "function")
   assert.equal(typeof hooks["tool.execute.after"], "function")
+})
+
+test("G10 before_finish blocks generate_tdd until a test runner has completed", async (t) => {
+  const tmp = makeTmp("harness-finish-gate/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  const sessionFile = join(tmp, "tdd-tracked.json")
+  withEnv(t, {
+    HARNESS_PRESET_FILE: storeFile,
+    HARNESS_CONFIG_DIR: configDir,
+    HARNESS_SESSION_STATE_FILE: sessionFile,
+  })
+  store.setActivePreset("ses_finish_gate", "tdd")
+  writeTddStore(t, sessionFile)
+  const hooks = await HarnessPlugin({})
+  const blocked = { allow: true }
+
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_finish_gate", model: {} },
+    blocked,
+  )
+  assert.equal(blocked.allow, false)
+
+  await hooks["tool.execute.after"](
+    { tool: "shell", sessionID: "ses_finish_gate", callID: "run", args: { command: "pytest" } },
+    makeOutputToolAfter(),
+  )
+  const allowed = { allow: true }
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_finish_gate", model: {} },
+    allowed,
+  )
+  assert.equal(allowed.allow, true)
 })

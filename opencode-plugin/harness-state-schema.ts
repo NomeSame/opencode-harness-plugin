@@ -15,5 +15,19 @@ export type HarnessStatePayload = Schema.Schema.Type<typeof HarnessStatePayload>
 export const HarnessReadState = Schema.Struct({
   activePreset: Schema.optional(Schema.String),
   presets: Schema.Array(Schema.String),
+  details: Schema.optional(
+    Schema.Record(
+      Schema.String,
+      Schema.Struct({
+        name: Schema.String,
+        model: Schema.String,
+        harnesses: Schema.Array(Schema.String),
+        parameters: Schema.Record(
+          Schema.String,
+          Schema.Struct({ value: Schema.Unknown, enforced: Schema.Boolean }),
+        ),
+      }),
+    ),
+  ),
 })
 export type HarnessReadState = Schema.Schema.Type<typeof HarnessReadState>

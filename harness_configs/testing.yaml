@@ -5,3 +5,12 @@ parameters:
   test_strategy:
     value: generate_tdd
     enforced: false
+  test_execution_after_code_changes:
+    value: true
+    enforced: false
+  test_execution_before_finishing:
+    value: true
+    enforced: false
+  test_execution_after_every_tool_operation:
+    value: false
+    enforced: false

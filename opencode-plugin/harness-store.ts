@@ -49,3 +49,13 @@ export function setActivePreset(sessionID: string, presetName: string): void {
   writeFileSync(tmp, JSON.stringify(map, null, 2), { encoding: "utf-8" })
   renameSync(tmp, file)
 }
+
+export function clearActivePreset(sessionID: string): void {
+  const file = presetFilePath()
+  const map = readMap(file)
+  if (!(sessionID in map)) return
+  delete map[sessionID]
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
+  writeFileSync(tmp, JSON.stringify(map, null, 2), { encoding: "utf-8" })
+  renameSync(tmp, file)
+}

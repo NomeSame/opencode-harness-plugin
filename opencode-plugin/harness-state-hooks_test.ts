@@ -118,8 +118,14 @@ test("plugin.state.read: returns the global Harness catalog without active sessi
       () => {
         const output: { payload: unknown } = { payload: null };
         hooks["plugin.state.read"]({ namespace: "harness" }, output);
-        assert.deepStrictEqual(output.payload, {
-          presets: ["Qwen Deep Coding"],
+        assert.deepStrictEqual((output.payload as any).presets, ["Qwen Deep Coding"]);
+        assert.deepStrictEqual((output.payload as any).details, {
+          "Qwen Deep Coding": {
+            name: "Qwen Deep Coding",
+            model: "qwen-3.8-27b",
+            harnesses: ["qwen"],
+            parameters: { temperature: { value: 0.7, enforced: true } },
+          },
         });
       },
     );

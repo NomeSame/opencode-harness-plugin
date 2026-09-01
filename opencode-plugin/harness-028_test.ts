@@ -17,11 +17,12 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 const store = await import("./harness-store.ts")
+const cli = await import("./harness-cli.ts")
 const pluginMod = await import("./harness-plugin.ts")
 const HarnessPlugin = pluginMod.default
 
@@ -47,6 +48,14 @@ function withEnv(t: test.TestContext, vars: Record<string, string | undefined>) 
 
 function makeOutputParts() {
   return { parts: [] as unknown[] }
+}
+
+function makeConfigDir(base: string): string {
+  const dir = join(base, "configs")
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, "qwen.yaml"), "name: qwen\nparameters:\n  temperature: {value: 1.0, enforced: true}\n", { encoding: "utf-8" })
+  writeFileSync(join(dir, "alpha.yaml"), "name: Alpha Preset\nharnesses:\n  - qwen\n", { encoding: "utf-8" })
+  return dir
 }
 
 // ---------------------------------------------------------------------------
@@ -126,4 +135,43 @@ test("E8 command.execute.before: Hooks-Objekt exposes 'command.execute.before'",
   withEnv(t, { HARNESS_PRESET_FILE: makeTmp("harness-cmd-expose/") + "/active-presets.json" })
   const hooks = await HarnessPlugin({})
   assert.equal(typeof hooks["command.execute.before"], "function")
+})
+
+test("E9 harness-set marks the command result as noReply", async (t) => {
+  withEnv(t, { HARNESS_PRESET_FILE: makeTmp("harness-cmd-no-reply/") + "/active-presets.json" })
+  const hooks = await HarnessPlugin({})
+  const output = makeOutputParts() as { parts: unknown[]; noReply?: boolean }
+
+  await hooks["command.execute.before"](
+    { sessionID: "ses_cmd_no_reply", command: "harness-set", arguments: "P" },
+    output,
+  )
+
+  assert.equal(output.noReply, true)
+})
+
+test("E10 harness-edit persists a selected preset's existing harness file", async (t) => {
+  const tmp = makeTmp("harness-cmd-edit/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  store.setActivePreset("ses_cmd_edit", "Alpha Preset")
+  const hooks = await HarnessPlugin({})
+  const output = makeOutputParts() as { parts: unknown[]; noReply?: boolean }
+
+  await hooks["command.execute.before"](
+    {
+      sessionID: "ses_cmd_edit",
+      command: "harness-edit",
+      arguments: JSON.stringify({ harness: "qwen", parameter: "temperature", value: "0.5", enforced: false }),
+    },
+    output,
+  )
+
+  assert.equal(output.noReply, true)
+  const source = readFileSync(join(configDir, "qwen.yaml"), "utf-8")
+  assert.match(source, /value: 0\.5/)
+  assert.doesNotMatch(source, /enforced: true/)
+  assert.equal(cli.resolvePreset("Alpha Preset", configDir)?.temperature?.value, 0.5)
 })
