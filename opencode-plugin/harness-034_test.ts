@@ -33,7 +33,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 const store = await import("./harness-store.ts")
 const pluginMod = await import("./harness-plugin.ts")
@@ -80,17 +80,19 @@ function makeOutputToolBefore() {
 }
 
 function makeOutputToolAfter() {
-  return { title: "", output: "" as string, metadata: null }
+  return { title: "", output: "" as string, metadata: { exit: 0 } }
 }
 
 // Test-Datei-Patterns (SOLL: diese werden NICHT gewarnt)
 const TEST_FILE_PATTERNS = [
   "test_example.py",
   "example_test.py",
+  "tests/unit/test_nested.py",
   "src/utils.test.ts",
   "src/utils.spec.ts",
   "test_example.go",
   "example_test.go",
+  "internal/service/test_nested.go",
 ]
 
 // Nicht-Test-Dateien (SOLL: gewarnt wenn generate_tdd + kein Testlauf)
@@ -102,7 +104,7 @@ const NON_TEST_FILES = [
 ]
 
 function writeTddStore(t: test.TestContext, file: string) {
-  mkdirSync(file.replace(/\/[^/]+$/, ""), { recursive: true })
+  mkdirSync(dirname(file), { recursive: true })
   writeFileSync(file, "{}", { encoding: "utf-8" })
 }
 
@@ -234,7 +236,7 @@ test("G5 tool.execute.after ignoriert keine-Test-Runner-Shell-Befehle", async (t
   await hooks["tool.execute.after"](input, output)
 })
 
-test("G5b fehlgeschlagener Testlauf gilt nicht als bestandener Testlauf", async (t) => {
+test("G5b failed test unlocks one implementation write but not the finish gate", async (t) => {
   const tmp = makeTmp("harness-tool-failed-test/")
   t.after(() => rmSync(tmp, { recursive: true, force: true }))
   const configDir = makeConfigDir(tmp)
@@ -255,19 +257,29 @@ test("G5b fehlgeschlagener Testlauf gilt nicht als bestandener Testlauf", async 
     { title: "pytest tests/", output: "1 failed", metadata: { exit: 1 } },
   )
 
-  await assert.rejects(
-    () =>
-      hooks["tool.execute.before"](
-        {
-          tool: "write",
-          sessionID: "ses_failed",
-          callID: "call_after_failed",
-          args: { path: "src/main.py", content: "new code" },
-        },
-        makeOutputToolBefore(),
-      ),
-    /TDD order violation/,
+  const implementationWrite = {
+    tool: "write",
+    sessionID: "ses_failed",
+    callID: "call_after_failed",
+    args: { path: "src/main.py", content: "new code" },
+  }
+  await hooks["tool.execute.before"](
+    implementationWrite,
+    makeOutputToolBefore(),
   )
+
+  await assert.rejects(
+    () => hooks["tool.execute.before"](implementationWrite, makeOutputToolBefore()),
+    /TDD order violation/,
+    "the failed run permits implementation but never counts as a post-change passing run",
+  )
+
+  const blocked = { allow: true }
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_failed", model: {} },
+    blocked,
+  )
+  assert.equal(blocked.allow, false)
 })
 
 test("G6 tool.execute.before/after ohne aktives Preset: kein Verhalten", async (t) => {
@@ -341,6 +353,182 @@ test("G10 before_finish blocks generate_tdd until a test runner has completed", 
   const allowed = { allow: true }
   await hooks["experimental.session.before_finish"](
     { sessionID: "ses_finish_gate", model: {} },
+    allowed,
+  )
+  assert.equal(allowed.allow, true)
+})
+
+test("G11 bun test is recognized as a real successful test run", async (t) => {
+  const tmp = makeTmp("harness-bun-test/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  const sessionFile = join(tmp, "tdd-tracked.json")
+  withEnv(t, {
+    HARNESS_PRESET_FILE: storeFile,
+    HARNESS_CONFIG_DIR: configDir,
+    HARNESS_SESSION_STATE_FILE: sessionFile,
+  })
+  store.setActivePreset("ses_bun", "tdd")
+  writeTddStore(t, sessionFile)
+  const hooks = await HarnessPlugin({})
+
+  await hooks["tool.execute.after"](
+    { tool: "shell", sessionID: "ses_bun", callID: "bun", args: { command: "bun test" } },
+    { title: "bun test", output: "1 pass", metadata: { exit: 0 } },
+  )
+
+  const allowed = { allow: true }
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_bun", model: {} },
+    allowed,
+  )
+  assert.equal(allowed.allow, true)
+})
+
+test("G12 failed bun test does not satisfy the finish gate", async (t) => {
+  const tmp = makeTmp("harness-bun-test-failed/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  const sessionFile = join(tmp, "tdd-tracked.json")
+  withEnv(t, {
+    HARNESS_PRESET_FILE: storeFile,
+    HARNESS_CONFIG_DIR: configDir,
+    HARNESS_SESSION_STATE_FILE: sessionFile,
+  })
+  store.setActivePreset("ses_bun_failed", "tdd")
+  writeTddStore(t, sessionFile)
+  const hooks = await HarnessPlugin({})
+
+  await hooks["tool.execute.after"](
+    { tool: "shell", sessionID: "ses_bun_failed", callID: "bun", args: { command: "bun test" } },
+    { title: "bun test", output: "1 fail", metadata: { exit: 1 } },
+  )
+
+  const blocked = { allow: true }
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_bun_failed", model: {} },
+    blocked,
+  )
+  assert.equal(blocked.allow, false)
+})
+
+test("G13 real core-shaped before hook reads write args from output.args", async (t) => {
+  const tmp = makeTmp("harness-real-before-shape/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  const sessionFile = join(tmp, "tdd-tracked.json")
+  withEnv(t, {
+    HARNESS_PRESET_FILE: storeFile,
+    HARNESS_CONFIG_DIR: configDir,
+    HARNESS_SESSION_STATE_FILE: sessionFile,
+  })
+  store.setActivePreset("ses_real_before", "tdd")
+  writeTddStore(t, sessionFile)
+  const hooks = await HarnessPlugin({})
+
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "write", sessionID: "ses_real_before", callID: "write" },
+      { args: { filePath: "/tmp/project/identifier.py", content: "implementation" } },
+    ),
+    /TDD order violation/,
+  )
+})
+
+test("G14 real bash payload with piped pytest failures does not satisfy finish gate", async (t) => {
+  const tmp = makeTmp("harness-real-bash-fail/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  const sessionFile = join(tmp, "tdd-tracked.json")
+  withEnv(t, {
+    HARNESS_PRESET_FILE: storeFile,
+    HARNESS_CONFIG_DIR: configDir,
+    HARNESS_SESSION_STATE_FILE: sessionFile,
+  })
+  store.setActivePreset("ses_real_bash_fail", "tdd")
+  writeTddStore(t, sessionFile)
+  const hooks = await HarnessPlugin({})
+
+  await hooks["tool.execute.after"](
+    {
+      tool: "bash",
+      sessionID: "ses_real_bash_fail",
+      callID: "pytest",
+      args: { command: "python -m pytest -q 2>&1 | tail -6" },
+    },
+    { title: "pytest", output: "50 failed in 2.16s", metadata: { exit: 0 } },
+  )
+  const blocked = { allow: true }
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_real_bash_fail", model: {} },
+    blocked,
+  )
+  assert.equal(blocked.allow, false)
+})
+
+test("G15 real bash payload with passing pytest satisfies finish gate", async (t) => {
+  const tmp = makeTmp("harness-real-bash-pass/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  const sessionFile = join(tmp, "tdd-tracked.json")
+  withEnv(t, {
+    HARNESS_PRESET_FILE: storeFile,
+    HARNESS_CONFIG_DIR: configDir,
+    HARNESS_SESSION_STATE_FILE: sessionFile,
+  })
+  store.setActivePreset("ses_real_bash_pass", "tdd")
+  writeTddStore(t, sessionFile)
+  const hooks = await HarnessPlugin({})
+
+  await hooks["tool.execute.after"](
+    {
+      tool: "bash",
+      sessionID: "ses_real_bash_pass",
+      callID: "pytest",
+      args: { command: "python -m pytest -q" },
+    },
+    { title: "pytest", output: "50 passed in 0.10s", metadata: { exit: 0 } },
+  )
+  const allowed = { allow: true }
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_real_bash_pass", model: {} },
+    allowed,
+  )
+  assert.equal(allowed.allow, true)
+})
+
+test("G16 python unittest is recognized as a real successful test run", async (t) => {
+  const tmp = makeTmp("harness-real-unittest-pass/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  const sessionFile = join(tmp, "tdd-tracked.json")
+  withEnv(t, {
+    HARNESS_PRESET_FILE: storeFile,
+    HARNESS_CONFIG_DIR: configDir,
+    HARNESS_SESSION_STATE_FILE: sessionFile,
+  })
+  store.setActivePreset("ses_real_unittest_pass", "tdd")
+  writeTddStore(t, sessionFile)
+  const hooks = await HarnessPlugin({})
+
+  await hooks["tool.execute.after"](
+    {
+      tool: "bash",
+      sessionID: "ses_real_unittest_pass",
+      callID: "unittest",
+      args: { command: "python -m unittest test_smoke.py -v" },
+    },
+    { title: "unittest", output: "Ran 1 test in 0.000s\n\nOK", metadata: { exit: 0 } },
+  )
+  const allowed = { allow: true }
+  await hooks["experimental.session.before_finish"](
+    { sessionID: "ses_real_unittest_pass", model: {} },
     allowed,
   )
   assert.equal(allowed.allow, true)

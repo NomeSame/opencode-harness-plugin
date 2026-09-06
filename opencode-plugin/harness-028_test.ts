@@ -54,6 +54,7 @@ function makeConfigDir(base: string): string {
   const dir = join(base, "configs")
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, "qwen.yaml"), "name: qwen\nparameters:\n  temperature: {value: 1.0, enforced: true}\n", { encoding: "utf-8" })
+  writeFileSync(join(dir, "coding.yaml"), "name: coding\nparameters:\n  max_iterations: {value: 30, enforced: false}\n", { encoding: "utf-8" })
   writeFileSync(join(dir, "alpha.yaml"), "name: Alpha Preset\nharnesses:\n  - qwen\n", { encoding: "utf-8" })
   return dir
 }
@@ -174,4 +175,56 @@ test("E10 harness-edit persists a selected preset's existing harness file", asyn
   assert.match(source, /value: 0\.5/)
   assert.doesNotMatch(source, /enforced: true/)
   assert.equal(cli.resolvePreset("Alpha Preset", configDir)?.temperature?.value, 0.5)
+})
+
+test("E11 harness-edit persists composition removal and keeps the preset selectable", async (t) => {
+  const tmp = makeTmp("harness-cmd-composition-remove/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  const hooks = await HarnessPlugin({})
+  const output = makeOutputParts() as { parts: unknown[]; noReply?: boolean }
+
+  await hooks["command.execute.before"](
+    {
+      sessionID: "ses_cmd_remove",
+      command: "harness-edit",
+      arguments: JSON.stringify({ preset: "Alpha Preset", operation: "remove", harness: "qwen" }),
+    },
+    output,
+  )
+
+  assert.equal(output.noReply, true)
+  assert.doesNotMatch(readFileSync(join(configDir, "alpha.yaml"), "utf-8"), /- qwen/)
+  assert.deepEqual(cli.describePreset("Alpha Preset", configDir)?.harnesses, [])
+  assert.deepEqual(cli.listPresets(configDir), ["Alpha Preset"])
+})
+
+test("E12 harness-edit persists additions once and rejects an unknown harness without saving it", async (t) => {
+  const tmp = makeTmp("harness-cmd-composition-add/")
+  t.after(() => rmSync(tmp, { recursive: true, force: true }))
+  const configDir = makeConfigDir(tmp)
+  const storeFile = join(tmp, "active-presets.json")
+  withEnv(t, { HARNESS_PRESET_FILE: storeFile, HARNESS_CONFIG_DIR: configDir })
+  const hooks = await HarnessPlugin({})
+
+  for (const harness of ["coding", "coding", "ghost"]) {
+    const output = makeOutputParts() as { parts: unknown[]; noReply?: boolean }
+    await hooks["command.execute.before"](
+      {
+        sessionID: "ses_cmd_add",
+        command: "harness-edit",
+        arguments: JSON.stringify({ preset: "Alpha Preset", operation: "add", harness }),
+      },
+      output,
+    )
+    assert.equal(output.noReply, true)
+    if (harness === "ghost") {
+      assert.match(JSON.stringify(output.parts), /HARNESS_EDIT_ERROR/)
+    }
+  }
+
+  assert.deepEqual(cli.describePreset("Alpha Preset", configDir)?.harnesses, ["qwen", "coding"])
+  assert.deepEqual(cli.listPresets(configDir), ["Alpha Preset"])
 })

@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { clearActivePreset, getActivePreset, setActivePreset } from "./harness-store.ts";
-import { defaultPresetForModel, describePreset, editHarness, resolvePreset, listPresets } from "./harness-cli.ts";
+import { defaultPresetForModel, describePreset, editHarness, editPresetComposition, resolvePreset, listPresets } from "./harness-cli.ts";
 import { applyEnforcedParams } from "./harness-params.ts";
 import { Schema } from "effect";
 import {
@@ -16,16 +16,18 @@ const TDD_INSTRUCTION =
 
 const TEST_FILE_PATTERNS = [
   /_test\.py$/,
-  /^test_.*\.py$/,
+  /(?:^|[\\/])test_[^\\/]*\.py$/,
   /\.test\.(ts|js|tsx|jsx)$/,
   /\.spec\.(ts|js|tsx|jsx)$/,
   /_test\.go$/,
-  /^test_.*\.go$/,
+  /(?:^|[\\/])test_[^\\/]*\.go$/,
   /_spec\.rb$/,
 ];
 
 const TEST_RUNNER_PATTERNS = [
   /\bpytest\b/,
+  /\bbun\s+test\b/,
+  /\b(?:python(?:3(?:\.\d+)?)?|py)\s+-m\s+unittest\b/,
   /\bnpm\s+test\b/,
   /\bgo\s+test\b/,
   /\bbundle\s+exec\s+rake\b/,
@@ -39,6 +41,24 @@ function isTestFilePath(filePath: string): boolean {
 
 function isTestRunnerCommand(command: string): boolean {
   return TEST_RUNNER_PATTERNS.some((p) => p.test(command));
+}
+
+const TEST_FAILURE_OUTPUT_PATTERNS = [
+  /\bFAILED\b/i,
+  /\b[1-9]\d*\s+failed\b/i,
+  /\b[1-9]\d*\s+fail(?:ure|ures)?\b/i,
+  /\b[1-9]\d*\s+errors?\b/i,
+];
+
+function testRunPassed(output: { output?: unknown; metadata?: unknown }): boolean {
+  const metadata = output.metadata;
+  const exitCode =
+    metadata && typeof metadata === "object" && "exit" in metadata
+      ? (metadata as { exit?: unknown }).exit
+      : undefined;
+  if (exitCode !== 0) return false;
+  const text = typeof output.output === "string" ? output.output : "";
+  return !TEST_FAILURE_OUTPUT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 function isWriteEditTool(toolName: string): boolean {
@@ -90,7 +110,14 @@ function tddStateFilePath(): string {
   );
 }
 
-function readTddState(): Record<string, { tested?: boolean }> {
+type TddSessionState = {
+  tested?: boolean;
+  testRunObserved?: boolean;
+  passing?: boolean;
+  trackedAt?: number;
+};
+
+function readTddState(): Record<string, TddSessionState> {
   try {
     const parsed = JSON.parse(readFileSync(tddStateFilePath(), "utf-8"));
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
@@ -109,19 +136,35 @@ function writeTddState(state: Record<string, { tested?: boolean }>): void {
 }
 
 function getSessionTested(sessionID: string): boolean {
-  return readTddState()[sessionID]?.tested === true;
+  const state = readTddState()[sessionID];
+  return state?.passing === true || state?.tested === true;
 }
 
-function markSessionTested(sessionID: string): void {
+function hasSessionTestRun(sessionID: string): boolean {
+  const state = readTddState()[sessionID];
+  return state?.testRunObserved === true || state?.tested === true;
+}
+
+function markSessionTestResult(sessionID: string, passing: boolean): void {
   const state = readTddState();
-  state[sessionID] = { tested: true, trackedAt: Date.now() };
+  state[sessionID] = {
+    tested: passing,
+    testRunObserved: true,
+    passing,
+    trackedAt: Date.now(),
+  };
   writeTddState(state);
 }
 
 function clearSessionTested(sessionID: string): void {
   const state = readTddState();
-  if (!state[sessionID]?.tested) return;
-  state[sessionID] = { tested: false, trackedAt: Date.now() };
+  if (!state[sessionID]) return;
+  state[sessionID] = {
+    tested: false,
+    testRunObserved: false,
+    passing: false,
+    trackedAt: Date.now(),
+  };
   writeTddState(state);
 }
 
@@ -200,13 +243,24 @@ export const HarnessPlugin: Plugin = async (input) => {
         let message = "No active Harness preset is available to edit.";
         try {
           const request = JSON.parse(cmdInput.arguments) as {
+            preset?: unknown;
             harness?: unknown;
             parameter?: unknown;
             value?: unknown;
             enforced?: unknown;
+            operation?: unknown;
           };
-          const detail = activePreset ? describePreset(activePreset) : null;
-          if (
+          const requestedPreset =
+            typeof request.preset === "string" && request.preset.trim()
+              ? request.preset
+              : activePreset;
+          const detail = requestedPreset ? describePreset(requestedPreset) : null;
+          if (detail && typeof request.harness === "string" && (request.operation === "add" || request.operation === "remove")) {
+            const saved = editPresetComposition(requestedPreset!, request.operation, request.harness);
+            message = saved
+              ? `Preset '${requestedPreset}' was saved. Re-open Switch harness to reload its composition.`
+              : `HARNESS_EDIT_ERROR: Could not ${request.operation} Harness '${request.harness}' in preset '${requestedPreset}'.`;
+          } else if (
             detail &&
             typeof request.harness === "string" &&
             detail.harnesses.includes(request.harness) &&
@@ -217,12 +271,13 @@ export const HarnessPlugin: Plugin = async (input) => {
             const saved = editHarness(request.harness, request.parameter, request.value, request.enforced);
             message = saved
               ? `Harness '${request.harness}' was saved. Re-open Switch harness to reload '${activePreset}'.`
-              : `Failed to save Harness '${request.harness}'. The existing file was left unchanged.`;
+              : `HARNESS_EDIT_ERROR: Failed to save Harness '${request.harness}'. The existing file was left unchanged.`;
           } else {
-            message = "Invalid edit request. Choose a harness from the active preset and provide a Python literal value.";
+            message = "HARNESS_EDIT_ERROR: Invalid edit request. Choose a harness from the selected preset and provide a valid edit.";
           }
-        } catch {
-          message = "Invalid edit request. Use JSON with harness, parameter, value and enforced fields.";
+        } catch (error) {
+          const detail = error instanceof Error && error.message ? ` ${error.message}` : "";
+          message = `HARNESS_EDIT_ERROR: Invalid edit request.${detail}`;
         }
         if (output?.parts) replacePartsWithMessage(output.parts, message);
         output.noReply = true;
@@ -316,16 +371,20 @@ export const HarnessPlugin: Plugin = async (input) => {
       )
         return;
       if (!isWriteEditTool(toolInput.tool)) return;
-      const args = (toolInput.args as Record<string, any>) || {};
+      const outputArgs = (output as { args?: Record<string, any> } | undefined)?.args;
+      const args =
+        (outputArgs && Object.keys(outputArgs).length > 0
+          ? outputArgs
+          : (toolInput as { args?: Record<string, any> }).args) || {};
       const filePath = args.path ?? args.file ?? args.filePath;
       if (!filePath || typeof filePath !== "string") return;
       if (isTestFilePath(filePath)) return;
-      if (getSessionTested(toolInput.sessionID)) {
+      if (hasSessionTestRun(toolInput.sessionID)) {
         clearSessionTested(toolInput.sessionID);
         return;
       }
       console.error(
-        `[harness] WARNING: Writing to non-test file '${filePath}' in session '${toolInput.sessionID}` +
+        `[harness] WARNING: Writing to non-test file '${filePath}' in session '${toolInput.sessionID}'` +
           ` with test_strategy=generate_tdd, but no test run has been executed yet.` +
           ` Follow TDD: write tests first, then implementation.`,
       );
@@ -345,21 +404,16 @@ export const HarnessPlugin: Plugin = async (input) => {
         strategy.value !== "generate_tdd"
       )
         return;
-      if (toolInput.tool !== "shell") return;
+      if (toolInput.tool !== "shell" && toolInput.tool !== "bash") return;
       const args = (toolInput.args as Record<string, any>) || {};
       const command = args.command ?? args.cmd ?? args._;
       if (typeof command !== "string") return;
       if (isTestRunnerCommand(command)) {
-        const metadata = output.metadata;
-        const exitCode =
-          metadata && typeof metadata === "object" && "exit" in metadata
-            ? (metadata as { exit?: unknown }).exit
-            : undefined;
-        if (typeof exitCode === "number" && exitCode !== 0) {
-          clearSessionTested(toolInput.sessionID);
+        if (!testRunPassed(output)) {
+          markSessionTestResult(toolInput.sessionID, false);
           return;
         }
-        markSessionTested(toolInput.sessionID);
+        markSessionTestResult(toolInput.sessionID, true);
       }
     },
   };

@@ -1,0 +1,9 @@
+name: P4 Runtime E2E
+description: Temporary real-runtime preset for the combined MVP acceptance flow
+harnesses:
+  - qwen
+  - final-authority
+  - coding
+  - long-context
+  - testing
+model: big-pickle
